@@ -362,28 +362,42 @@ const today = () => new Date().toISOString().split("T")[0];
 const addDays = (date, days) => { const d = new Date(date); d.setDate(d.getDate() + days); return d.toISOString().split("T")[0]; };
 
 // Equipos habilitados para carga diaria de horas de funcionamiento.
+// Nombres tal como figuran en el PMS (NUEVO_PLAN_DE_MANTENIMIENTO_REV3.xlsx, hoja "Hoja1").
 // El orden de esta lista es el orden en que se muestran en la pantalla "Carga de horas".
 const EQUIPOS_HORAS = [
-  "MMPP BB",
-  "MMPP EB",
-  "MMAA N°1",
-  "MMAA N°2",
-  "MMAA EGA",
-  "BOW THRUSTER",
-  "RADAR N°1",
-  "RADAR N°2",
-  "COMPRESOR N°1",
-  "COMPRESOR N°2",
+  "MMPP N°1 MAK 8M 453 AK",
+  "MMPP N°2 MAK 8M 453 AK",
+  "MMGG N°1 SCANIA DI 1259",
+  "MMGG N°2 SCANIA DI 1259",
+  "MMGG N°3 EGA DETROIT DIESEL V71",
+  "MMDD BOW TRUSTER DETROIT DIESEL V71",
+  "RADAR BABOR",
+  "RADAR ESTRIBOR",
+  "COMPRESOR BB QUINCY QR-25 340",
+  "COMPRESOR EB QUINCY QR-25 340",
 ];
 
-// Normaliza nombres para comparar sin depender de mayúsculas/acentos/espacios extra
+// Normaliza nombres para comparar sin depender de mayúsculas, acentos, el símbolo de
+// grado/ordinal ("°" vs "º"), guiones o espacios. Deja solo letras y números.
 const normalizaNombre = (s = "") =>
   s
     .normalize("NFD")
-    .replace(/[\u0300-\u036f]/g, "")
-    .trim()
+    .replace(/[\u0300-\u036f]/g, "") // quita acentos
     .toUpperCase()
-    .replace(/\s+/g, " ");
+    .replace(/[^A-Z0-9]/g, ""); // quita espacios, °, º, N°/Nº, guiones, puntos, etc.
+
+// Busca un equipo por nombre tolerando variantes: primero coincidencia exacta
+// (normalizada), y si no hay, coincidencia parcial (uno contiene al otro).
+// Esto cubre casos como "RADAR N°1" en la lista vs "RADAR Nº1 FURUNO" en la base.
+function buscaEquipoPorNombre(equipos, nombreBuscado) {
+  const objetivo = normalizaNombre(nombreBuscado);
+  const exacto = equipos.find(eq => normalizaNombre(eq.nombre) === objetivo);
+  if (exacto) return exacto;
+  return equipos.find(eq => {
+    const actual = normalizaNombre(eq.nombre);
+    return actual.includes(objetivo) || objetivo.includes(actual);
+  }) || null;
+}
 
 const api = {
   async getBuques() {
@@ -871,10 +885,13 @@ function PageHoras({ buque, notify }) {
 
   useEffect(() => { load(); }, [load]);
 
-  // Solo los equipos de la lista EQUIPOS_HORAS, en ese orden, matcheando por nombre normalizado.
+  // Solo los equipos de la lista EQUIPOS_HORAS, en ese orden, con matching tolerante a variantes de nombre.
   const equiposHoras = EQUIPOS_HORAS
-    .map(nombre => equipos.find(eq => normalizaNombre(eq.nombre) === normalizaNombre(nombre)))
+    .map(nombre => buscaEquipoPorNombre(equipos, nombre))
     .filter(Boolean);
+
+  // Equipos de la lista que NO se pudieron matchear contra ninguno de los equipos cargados.
+  const equiposHorasFaltantes = EQUIPOS_HORAS.filter(nombre => !buscaEquipoPorNombre(equipos, nombre));
 
   const handleGuardar = async () => {
     const regs = Object.entries(horas).filter(([, v]) => v).map(([equipo_id, v]) => ({
@@ -906,6 +923,11 @@ function PageHoras({ buque, notify }) {
           <div className="info-box warn mb12" style={{ fontSize: 11 }}>
             Ingresá las horas totales acumuladas de cada equipo. El sistema calcula el promedio diario automáticamente para forecastear vencimientos.
           </div>
+          {equiposHorasFaltantes.length > 0 && (
+            <div className="info-box danger mb12" style={{ fontSize: 11 }}>
+              No se encontraron en "Plan completo" estos equipos: {equiposHorasFaltantes.join(", ")}. Verificá que el nombre cargado en el equipo coincida (o contenga) ese texto.
+            </div>
+          )}
           {equiposHoras.length === 0
             ? <div className="empty-state">Ninguno de los equipos habilitados para carga de horas está creado en este buque. Revisá que los nombres en "Plan completo" coincidan con: {EQUIPOS_HORAS.join(", ")}.</div>
             : <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(220px, 1fr))", gap: 14 }}>
