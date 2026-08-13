@@ -361,6 +361,30 @@ const fmtDate = d => d ? new Date(d + "T00:00:00").toLocaleDateString("es-AR") :
 const today = () => new Date().toISOString().split("T")[0];
 const addDays = (date, days) => { const d = new Date(date); d.setDate(d.getDate() + days); return d.toISOString().split("T")[0]; };
 
+// Equipos habilitados para carga diaria de horas de funcionamiento.
+// El orden de esta lista es el orden en que se muestran en la pantalla "Carga de horas".
+const EQUIPOS_HORAS = [
+  "MMPP BB",
+  "MMPP EB",
+  "MMAA N°1",
+  "MMAA N°2",
+  "MMAA EGA",
+  "BOW THRUSTER",
+  "RADAR N°1",
+  "RADAR N°2",
+  "COMPRESOR N°1",
+  "COMPRESOR N°2",
+];
+
+// Normaliza nombres para comparar sin depender de mayúsculas/acentos/espacios extra
+const normalizaNombre = (s = "") =>
+  s
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .trim()
+    .toUpperCase()
+    .replace(/\s+/g, " ");
+
 const api = {
   async getBuques() {
     const { data, error } = await supabase.from("mant_buques").select("*").eq("activo", true).order("nombre");
@@ -847,6 +871,11 @@ function PageHoras({ buque, notify }) {
 
   useEffect(() => { load(); }, [load]);
 
+  // Solo los equipos de la lista EQUIPOS_HORAS, en ese orden, matcheando por nombre normalizado.
+  const equiposHoras = EQUIPOS_HORAS
+    .map(nombre => equipos.find(eq => normalizaNombre(eq.nombre) === normalizaNombre(nombre)))
+    .filter(Boolean);
+
   const handleGuardar = async () => {
     const regs = Object.entries(horas).filter(([, v]) => v).map(([equipo_id, v]) => ({
       buque_id: buque.id, equipo_id, horas: parseInt(v), fecha, registrado_por: USUARIO,
@@ -877,10 +906,10 @@ function PageHoras({ buque, notify }) {
           <div className="info-box warn mb12" style={{ fontSize: 11 }}>
             Ingresá las horas totales acumuladas de cada equipo. El sistema calcula el promedio diario automáticamente para forecastear vencimientos.
           </div>
-          {equipos.length === 0
-            ? <div className="empty-state">Sin equipos registrados</div>
+          {equiposHoras.length === 0
+            ? <div className="empty-state">Ninguno de los equipos habilitados para carga de horas está creado en este buque. Revisá que los nombres en "Plan completo" coincidan con: {EQUIPOS_HORAS.join(", ")}.</div>
             : <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(220px, 1fr))", gap: 14 }}>
-                {equipos.filter(eq => eq.sector === "MAQ" || !eq.sector).map(eq => (
+                {equiposHoras.map(eq => (
                   <div key={eq.id} style={{ display: "flex", flexDirection: "column", gap: 5 }}>
                     <label style={{ fontSize: 10, color: "var(--navy)", letterSpacing: ".5px", textTransform: "uppercase", fontWeight: 600 }}>{eq.nombre}</label>
                     <input type="number" className="hs-input" placeholder="0" value={horas[eq.id] || ""}
@@ -890,7 +919,7 @@ function PageHoras({ buque, notify }) {
               </div>
           }
           <div className="mt16" style={{ display: "flex", justifyContent: "flex-end", borderTop: "1px solid var(--border)", paddingTop: 14 }}>
-            <button className="btn btn-primary" onClick={handleGuardar} disabled={saving || !equipos.length}>
+            <button className="btn btn-primary" onClick={handleGuardar} disabled={saving || !equiposHoras.length}>
               {saving ? "Guardando..." : "Guardar registro"}
             </button>
           </div>
@@ -985,6 +1014,7 @@ function PageKPIs({ buque }) {
 function PagePlan({ buque, notify }) {
   const [tareas, setTareas] = useState([]);
   const [equipos, setEquipos] = useState([]);
+  const [horasMap, setHorasMap] = useState({});
   const [loading, setLoading] = useState(true);
   const [modalTarea, setModalTarea] = useState(false);
   const [modalEquipo, setModalEquipo] = useState(false);
@@ -994,19 +1024,33 @@ function PagePlan({ buque, notify }) {
   const load = useCallback(async () => {
     setLoading(true);
     try {
-      const [t, eq] = await Promise.all([api.getTareas(buque.id), api.getEquipos(buque.id)]);
-      setTareas(t); setEquipos(eq);
+      const [t, eq, hrs] = await Promise.all([api.getTareas(buque.id), api.getEquipos(buque.id), api.getUltimasHoras(buque.id)]);
+      setTareas(t); setEquipos(eq); setHorasMap(hrs);
     } finally { setLoading(false); }
   }, [buque.id]);
 
   useEffect(() => { load(); }, [load]);
 
+  // Cada tarea de tipo "horas" queda linqueada a las horas cargadas de su equipo
+  // (mant_registros_horas, vía equipo_id) para mostrar cuánto falta para el vencimiento.
+  const tareasConEstado = tareas.map(t => {
+    if (t.tipo_frecuencia === "horas" && t.frecuencia_hs) {
+      const horasActuales = horasMap[t.equipo_id] || 0;
+      const estado = calcEstado(t, horasActuales);
+      return { ...t, horasActuales, ...estado };
+    }
+    return { ...t, horasActuales: null, estado: null, restante: null, pct: 0 };
+  });
+
   const sectores = [...new Set(equipos.map(e => e.sector).filter(Boolean))].sort();
-  const filtradas = tareas.filter(t => {
+  const filtradas = tareasConEstado.filter(t => {
     if (filtroSector && t.mant_equipos?.sector !== filtroSector) return false;
     if (busqueda && !t.descripcion?.toLowerCase().includes(busqueda.toLowerCase()) && !t.codigo?.toLowerCase().includes(busqueda.toLowerCase())) return false;
     return true;
   });
+
+  const ESTADO_BADGE = { vencida: "b-red", proxima: "b-amber", ok: "b-green", sin_datos: "b-gray" };
+  const ESTADO_LABEL = { vencida: "Vencida", proxima: "Próxima", ok: "Al día", sin_datos: "Sin horas cargadas" };
 
   return (
     <div>
@@ -1026,7 +1070,7 @@ function PagePlan({ buque, notify }) {
         <div className="card" style={{ padding: 0 }}>
           <div className="table-wrap">
             <table>
-              <thead><tr><th>Código</th><th>Equipo</th><th>Sector</th><th>Descripción</th><th>Frecuencia</th><th>Último</th><th>Crítica</th></tr></thead>
+              <thead><tr><th>Código</th><th>Equipo</th><th>Sector</th><th>Descripción</th><th>Frecuencia</th><th>Horas actuales</th><th>Restante</th><th>Estado</th><th>Crítica</th></tr></thead>
               <tbody>
                 {filtradas.map(t => (
                   <tr key={t.id}>
@@ -1035,7 +1079,16 @@ function PagePlan({ buque, notify }) {
                     <td style={{ fontSize: 11, color: "var(--muted)" }}>{t.mant_equipos?.sector || "—"}</td>
                     <td style={{ fontSize: 12 }}>{t.descripcion}</td>
                     <td className="text-mono" style={{ fontSize: 11, color: "var(--blue)" }}>{t.tipo_frecuencia === "horas" ? `${t.frecuencia_hs} hs` : t.frecuencia_texto}</td>
-                    <td style={{ fontSize: 11, color: "var(--muted)" }}>{t.ultima_ejecucion_hs ? `${t.ultima_ejecucion_hs} hs` : fmtDate(t.ultima_ejecucion_fecha)}</td>
+                    <td className="text-mono" style={{ fontSize: 11, color: "var(--muted)" }}>
+                      {t.tipo_frecuencia === "horas" ? `${t.horasActuales} hs` : "—"}
+                    </td>
+                    <td className="text-mono" style={{ fontSize: 11, fontWeight: 600, color: t.estado === "vencida" ? "var(--danger)" : t.estado === "proxima" ? "var(--warn)" : "var(--muted)" }}>
+                      {t.tipo_frecuencia !== "horas" ? (t.ultima_ejecucion_fecha ? fmtDate(t.ultima_ejecucion_fecha) : "—")
+                        : t.estado === "sin_datos" ? "—"
+                        : t.restante < 0 ? `Vencida hace ${Math.abs(Math.round(t.restante))} hs`
+                        : `Faltan ${Math.round(t.restante)} hs`}
+                    </td>
+                    <td>{t.tipo_frecuencia === "horas" ? <span className={`badge ${ESTADO_BADGE[t.estado]}`}>{ESTADO_LABEL[t.estado]}</span> : <span style={{ color: "var(--muted2)", fontSize: 11 }}>Por fecha</span>}</td>
                     <td>{t.es_critica ? <span className="badge b-red">Sí</span> : <span style={{ color: "var(--muted2)", fontSize: 11 }}>—</span>}</td>
                   </tr>
                 ))}
