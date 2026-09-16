@@ -1,5 +1,6 @@
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useMemo } from "react";
 import { supabase } from "./lib/supabase";
+import { TAXONOMIA_TECNICA } from "./lib/taxonomiaTecnica";
 
 const USUARIO = "Jefe de Máquinas";
 
@@ -81,6 +82,16 @@ tr.click:hover td{background:var(--surface2);cursor:pointer}
 .tracker-table td{padding:12px;border-bottom:1px solid var(--border);vertical-align:middle}
 .tracker-table tr:hover td{background:var(--surface2);cursor:pointer}
 .tracker-table tr:last-child td{border-bottom:none}
+
+/*  ARBOL · plan de mantenimiento por código jerárquico  */
+.arbol-nodo{border-bottom:1px solid var(--border)}
+.arbol-nodo:last-child{border-bottom:none}
+.arbol-fila{display:flex;align-items:center;gap:10px;width:100%;background:none;border:0;cursor:pointer;padding:11px 12px;text-align:left;font-family:var(--sans)}
+.arbol-fila:hover{background:var(--surface2)}
+.arbol-caret{color:var(--muted2);font-size:11px;width:10px;flex:0 0 auto}
+.arbol-codigo{font-family:var(--mono);font-size:11px;color:var(--muted);flex:0 0 auto}
+.arbol-label{font-size:13px;font-weight:500;color:var(--navy);flex:1 1 auto}
+.arbol-count{font-family:var(--mono);font-size:11px;color:var(--muted2);flex:0 0 auto}
 
 /*  FILTROS  */
 .filter-row{display:flex;gap:8px;margin-bottom:16px;flex-wrap:wrap;align-items:center}
@@ -1032,7 +1043,121 @@ function PageKPIs({ buque }) {
   );
 }
 
-//  PAGE: PLAN 
+//  PAGE: PLAN (árbol jerárquico por código, ej: 10 MMPP → 10.01 MMPP N°1 → 10.01.01 Sist. inyección → tareas)
+function compararCodigos(a, b) {
+  const pa = a.split(".").map(Number), pb = b.split(".").map(Number);
+  for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+    const na = pa[i] ?? -1, nb = pb[i] ?? -1;
+    if (na !== nb) return na - nb;
+  }
+  return 0;
+}
+
+// Agrupa las tareas bajo los nodos de TAXONOMIA_TECNICA cuyo código es prefijo
+// (por punto) del código de la tarea. Una tarea sin código, o cuyo código no
+// nidea bajo ningún nodo conocido, va a "otras" agrupada por equipo.
+// Códigos cuyo padre no se puede inferir por prefijo de punto porque el Excel los
+// numera como "hermanos" en vez de anidarlos (71/72 bajo 70 PURIFICADORAS,
+// 81-89 y 810-816 bajo 80 BOMBAS).
+const PADRE_MANUAL = {
+  "71": "70", "72": "70",
+  "81": "80", "82": "80", "83": "80", "84": "80", "85": "80", "86": "80", "87": "80", "88": "80", "89": "80",
+  "810": "80", "811": "80", "812": "80", "813": "80", "814": "80", "815": "80", "816": "80",
+};
+
+function construirArbolTareas(tareas) {
+  const taxKeys = Object.keys(TAXONOMIA_TECNICA);
+  const raiz = new Map();
+  const otras = new Map();
+
+  const getOrCreate = (mapa, codigo) => {
+    if (!mapa.has(codigo)) mapa.set(codigo, { codigo, label: TAXONOMIA_TECNICA[codigo] || codigo, children: new Map(), tareas: [] });
+    return mapa.get(codigo);
+  };
+
+  for (const t of tareas) {
+    const codigo = (t.codigo || "").trim();
+    const cadena = codigo && codigo !== "—"
+      ? taxKeys.filter(k => k !== codigo && codigo.startsWith(k + ".")).sort((a, b) => a.split(".").length - b.split(".").length)
+      : [];
+    const padreManual = PADRE_MANUAL[codigo.split(".")[0]];
+    if (padreManual) cadena.unshift(padreManual);
+    if (cadena.length === 0) {
+      const nombreEq = t.mant_equipos?.nombre || "Sin equipo";
+      if (!otras.has(nombreEq)) otras.set(nombreEq, []);
+      otras.get(nombreEq).push(t);
+      continue;
+    }
+    let mapaActual = raiz, nodo = null;
+    for (const key of cadena) { nodo = getOrCreate(mapaActual, key); mapaActual = nodo.children; }
+    nodo.tareas.push(t);
+  }
+  return { raiz, otras };
+}
+
+function contarTareas(nodo) {
+  let total = nodo.tareas.length;
+  for (const hijo of nodo.children.values()) total += contarTareas(hijo);
+  return total;
+}
+
+function FilaTarea({ t, ESTADO_BADGE, ESTADO_LABEL }) {
+  return (
+    <tr>
+      <td className="text-mono" style={{ fontSize: 10, color: "var(--muted)" }}>{t.codigo || "—"}</td>
+      <td style={{ fontSize: 12 }}>{t.descripcion}</td>
+      <td className="text-mono" style={{ fontSize: 11, color: "var(--blue)" }}>{t.tipo_frecuencia === "horas" ? `${t.frecuencia_hs} hs` : t.frecuencia_texto}</td>
+      <td className="text-mono" style={{ fontSize: 11, color: "var(--muted)" }}>{t.tipo_frecuencia === "horas" ? `${t.horasActuales} hs` : "—"}</td>
+      <td className="text-mono" style={{ fontSize: 11, fontWeight: 600, color: t.estado === "vencida" ? "var(--danger)" : t.estado === "proxima" ? "var(--warn)" : "var(--muted)" }}>
+        {t.tipo_frecuencia !== "horas" ? (t.ultima_ejecucion_fecha ? fmtDate(t.ultima_ejecucion_fecha) : "—")
+          : t.estado === "sin_datos" ? "—"
+          : t.restante < 0 ? `Vencida hace ${Math.abs(Math.round(t.restante))} hs`
+          : `Faltan ${Math.round(t.restante)} hs`}
+      </td>
+      <td>{t.tipo_frecuencia === "horas" ? <span className={`badge ${ESTADO_BADGE[t.estado]}`}>{ESTADO_LABEL[t.estado]}</span> : <span style={{ color: "var(--muted2)", fontSize: 11 }}>Por fecha</span>}</td>
+      <td>{t.es_critica ? <span className="badge b-red">Sí</span> : <span style={{ color: "var(--muted2)", fontSize: 11 }}>—</span>}</td>
+    </tr>
+  );
+}
+
+function TablaTareas({ tareas, ESTADO_BADGE, ESTADO_LABEL }) {
+  return (
+    <div className="table-wrap">
+      <table>
+        <thead><tr><th>Código</th><th>Descripción</th><th>Frecuencia</th><th>Horas actuales</th><th>Restante</th><th>Estado</th><th>Crítica</th></tr></thead>
+        <tbody>{tareas.map(t => <FilaTarea key={t.id} t={t} ESTADO_BADGE={ESTADO_BADGE} ESTADO_LABEL={ESTADO_LABEL} />)}</tbody>
+      </table>
+    </div>
+  );
+}
+
+function NodoArbol({ nodo, depth, expandido, alternar, forzarAbierto, ESTADO_BADGE, ESTADO_LABEL }) {
+  const abierto = forzarAbierto || expandido.has(nodo.codigo);
+  const hijos = [...nodo.children.values()].sort((a, b) => compararCodigos(a.codigo, b.codigo));
+  return (
+    <div className="arbol-nodo">
+      <button className="arbol-fila" style={{ paddingLeft: 12 + depth * 20 }} onClick={() => alternar(nodo.codigo)}>
+        <span className="arbol-caret">{abierto ? "▾" : "▸"}</span>
+        <span className="arbol-codigo">{nodo.codigo}</span>
+        <span className="arbol-label">{nodo.label}</span>
+        <span className="arbol-count">{contarTareas(nodo)}</span>
+      </button>
+      {abierto && (
+        <div>
+          {hijos.map(hijo => (
+            <NodoArbol key={hijo.codigo} nodo={hijo} depth={depth + 1} expandido={expandido} alternar={alternar} forzarAbierto={forzarAbierto} ESTADO_BADGE={ESTADO_BADGE} ESTADO_LABEL={ESTADO_LABEL} />
+          ))}
+          {nodo.tareas.length > 0 && (
+            <div style={{ paddingLeft: 12 + (depth + 1) * 20 }}>
+              <TablaTareas tareas={nodo.tareas} ESTADO_BADGE={ESTADO_BADGE} ESTADO_LABEL={ESTADO_LABEL} />
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function PagePlan({ buque, notify }) {
   const [tareas, setTareas] = useState([]);
   const [equipos, setEquipos] = useState([]);
@@ -1042,6 +1167,7 @@ function PagePlan({ buque, notify }) {
   const [modalEquipo, setModalEquipo] = useState(false);
   const [filtroSector, setFiltroSector] = useState("");
   const [busqueda, setBusqueda] = useState("");
+  const [expandido, setExpandido] = useState(() => new Set());
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -1071,6 +1197,19 @@ function PagePlan({ buque, notify }) {
     return true;
   });
 
+  const { raiz, otras } = useMemo(() => construirArbolTareas(filtradas), [filtradas]);
+  const gruposRaiz = [...raiz.values()].sort((a, b) => compararCodigos(a.codigo, b.codigo));
+  const gruposOtras = [...otras.entries()];
+  // Con búsqueda o filtro de sector activos, se fuerzan todas las ramas abiertas
+  // para no obligar a desplegar manualmente hasta encontrar el resultado.
+  const forzarAbierto = Boolean(busqueda || filtroSector);
+
+  const alternar = (codigo) => setExpandido(prev => {
+    const next = new Set(prev);
+    if (next.has(codigo)) next.delete(codigo); else next.add(codigo);
+    return next;
+  });
+
   const ESTADO_BADGE = { vencida: "b-red", proxima: "b-amber", ok: "b-green", sin_datos: "b-gray" };
   const ESTADO_LABEL = { vencida: "Vencida", proxima: "Próxima", ok: "Al día", sin_datos: "Sin horas cargadas" };
 
@@ -1089,34 +1228,24 @@ function PagePlan({ buque, notify }) {
       </div>
       {loading ? <div className="loading"><span className="spin">◌</span> Cargando...</div> :
         filtradas.length === 0 ? <div className="empty-state"><div style={{ fontSize: 28, marginBottom: 8 }}></div>Sin tareas</div> :
-        <div className="card" style={{ padding: 0 }}>
-          <div className="table-wrap">
-            <table>
-              <thead><tr><th>Código</th><th>Equipo</th><th>Sector</th><th>Descripción</th><th>Frecuencia</th><th>Horas actuales</th><th>Restante</th><th>Estado</th><th>Crítica</th></tr></thead>
-              <tbody>
-                {filtradas.map(t => (
-                  <tr key={t.id}>
-                    <td className="text-mono" style={{ fontSize: 10, color: "var(--muted)" }}>{t.codigo || "—"}</td>
-                    <td style={{ fontSize: 12, fontWeight: 500 }}>{t.mant_equipos?.nombre}</td>
-                    <td style={{ fontSize: 11, color: "var(--muted)" }}>{t.mant_equipos?.sector || "—"}</td>
-                    <td style={{ fontSize: 12 }}>{t.descripcion}</td>
-                    <td className="text-mono" style={{ fontSize: 11, color: "var(--blue)" }}>{t.tipo_frecuencia === "horas" ? `${t.frecuencia_hs} hs` : t.frecuencia_texto}</td>
-                    <td className="text-mono" style={{ fontSize: 11, color: "var(--muted)" }}>
-                      {t.tipo_frecuencia === "horas" ? `${t.horasActuales} hs` : "—"}
-                    </td>
-                    <td className="text-mono" style={{ fontSize: 11, fontWeight: 600, color: t.estado === "vencida" ? "var(--danger)" : t.estado === "proxima" ? "var(--warn)" : "var(--muted)" }}>
-                      {t.tipo_frecuencia !== "horas" ? (t.ultima_ejecucion_fecha ? fmtDate(t.ultima_ejecucion_fecha) : "—")
-                        : t.estado === "sin_datos" ? "—"
-                        : t.restante < 0 ? `Vencida hace ${Math.abs(Math.round(t.restante))} hs`
-                        : `Faltan ${Math.round(t.restante)} hs`}
-                    </td>
-                    <td>{t.tipo_frecuencia === "horas" ? <span className={`badge ${ESTADO_BADGE[t.estado]}`}>{ESTADO_LABEL[t.estado]}</span> : <span style={{ color: "var(--muted2)", fontSize: 11 }}>Por fecha</span>}</td>
-                    <td>{t.es_critica ? <span className="badge b-red">Sí</span> : <span style={{ color: "var(--muted2)", fontSize: 11 }}>—</span>}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
+        <div className="card arbol" style={{ padding: 0 }}>
+          {gruposRaiz.map(nodo => (
+            <NodoArbol key={nodo.codigo} nodo={nodo} depth={0} expandido={expandido} alternar={alternar} forzarAbierto={forzarAbierto} ESTADO_BADGE={ESTADO_BADGE} ESTADO_LABEL={ESTADO_LABEL} />
+          ))}
+          {gruposOtras.map(([nombreEq, ts]) => {
+            const codigoOtras = `otras:${nombreEq}`;
+            const abierto = forzarAbierto || expandido.has(codigoOtras);
+            return (
+              <div className="arbol-nodo" key={codigoOtras}>
+                <button className="arbol-fila" style={{ paddingLeft: 12 }} onClick={() => alternar(codigoOtras)}>
+                  <span className="arbol-caret">{abierto ? "▾" : "▸"}</span>
+                  <span className="arbol-label">{nombreEq} — otras tareas sin código jerárquico</span>
+                  <span className="arbol-count">{ts.length}</span>
+                </button>
+                {abierto && <div style={{ paddingLeft: 32 }}><TablaTareas tareas={ts} ESTADO_BADGE={ESTADO_BADGE} ESTADO_LABEL={ESTADO_LABEL} /></div>}
+              </div>
+            );
+          })}
         </div>
       }
       {modalTarea && <TareaModal buqueId={buque.id} equipos={equipos} onClose={() => setModalTarea(false)} onSave={() => { setModalTarea(false); notify("Tarea creada", "success"); load(); }} />}
@@ -1438,7 +1567,7 @@ function MantenimientoApp() {
 
       <div className={`shell ${navOpen ? "" : "is-collapsed"}`}>
         <nav className="sidebar">
-          <div className="sidebar-header">
+          <div className="sidebar-header" onClick={() => setPage("dashboard")} style={{ cursor: "pointer" }}>
             <img src="/PL.png" alt="PL Offshore" className="sidebar-logo-img" onError={e => { e.currentTarget.style.display = "none"; }} />
             {navOpen && (
               <div>
