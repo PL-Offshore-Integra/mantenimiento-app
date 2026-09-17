@@ -340,6 +340,11 @@ tr.click:hover td{background:var(--surface2);cursor:pointer}
 .sidebar-foot-btn{display:flex;align-items:center;gap:12px;width:100%;padding:9px 10px;background:none;border:0;border-radius:var(--r);cursor:pointer;font:500 13px/1.2 var(--sans);color:var(--muted);transition:var(--tr)}
 .sidebar-foot-btn:hover{background:var(--surface2);color:var(--navy)}
 .sidebar-foot-meta{padding:8px 10px 0;font-family:var(--mono);font-size:11px;font-weight:500;line-height:1.6;letter-spacing:.06em;color:var(--muted2)}
+.user-menu-wrap{position:relative}
+.user-menu-popup{position:absolute;left:0;right:0;bottom:calc(100% + 6px);background:var(--navy);border-radius:var(--r);padding:6px;box-shadow:0 8px 24px rgba(0,0,0,.25);z-index:20}
+.user-menu-item{display:flex;align-items:center;gap:10px;width:100%;padding:9px 10px;background:none;border:0;border-radius:calc(var(--r) - 2px);cursor:pointer;font:500 13px/1.2 var(--sans);color:rgba(255,255,255,.86);transition:var(--tr)}
+.user-menu-item:hover{background:rgba(255,255,255,.1)}
+.user-menu-meta{border-top:1px solid rgba(255,255,255,.14);margin-top:4px;padding:8px 10px 4px;font-family:var(--mono);font-size:11px;font-weight:500;line-height:1.6;letter-spacing:.04em;color:rgba(255,255,255,.5)}
 .shell.is-collapsed .sidebar-header{justify-content:center;padding:16px 8px}
 .shell.is-collapsed .ni{justify-content:center;padding:9px 8px 9px 5px}
 .shell.is-collapsed .sidebar-foot-btn{justify-content:center}
@@ -384,8 +389,8 @@ const EQUIPOS_HORAS = [
   "MMDD BOW TRUSTER DETROIT DIESEL V71",
   "RADAR BABOR",
   "RADAR ESTRIBOR",
-  "COMPRESOR BB QUINCY QR-25 340",
-  "COMPRESOR EB QUINCY QR-25 340",
+  "COMPRESOR BB",
+  "COMPRESOR EB",
 ];
 
 // Normaliza nombres para comparar sin depender de mayúsculas, acentos, el símbolo de
@@ -877,20 +882,23 @@ function PageDashboard({ buque, notify }) {
 }
 
 //  PAGE: CARGA DE HORAS 
-function PageHoras({ buque, notify }) {
+const HORAS_MAX_POR_DIA = 24;
+
+function PageHoras({ buque, notify, esGerente }) {
   const [equipos, setEquipos] = useState([]);
-  const [horas, setHoras] = useState({});
+  const [valores, setValores] = useState({});
   const [registros, setRegistros] = useState([]);
   const [loading, setLoading] = useState(true);
-  const [saving, setSaving] = useState(false);
+  const [guardandoId, setGuardandoId] = useState(null);
   const [fecha, setFecha] = useState(today());
   const [tab, setTab] = useState("carga");
 
   const load = useCallback(async () => {
     setLoading(true);
     try {
-      const [eq, hrs, regs] = await Promise.all([api.getEquipos(buque.id), api.getUltimasHoras(buque.id), api.getRegistrosHoras(buque.id)]);
-      setEquipos(eq); setHoras(hrs); setRegistros(regs.slice(0, 100));
+      const [eq, regs] = await Promise.all([api.getEquipos(buque.id), api.getRegistrosHoras(buque.id)]);
+      setEquipos(eq); setRegistros(regs.slice(0, 100));
+      setValores({});
     } finally { setLoading(false); }
   }, [buque.id]);
 
@@ -904,15 +912,43 @@ function PageHoras({ buque, notify }) {
   // Equipos de la lista que NO se pudieron matchear contra ninguno de los equipos cargados.
   const equiposHorasFaltantes = EQUIPOS_HORAS.filter(nombre => !buscaEquipoPorNombre(equipos, nombre));
 
-  const handleGuardar = async () => {
-    const regs = Object.entries(horas).filter(([, v]) => v).map(([equipo_id, v]) => ({
-      buque_id: buque.id, equipo_id, horas: parseInt(v), fecha, registrado_por: USUARIO,
-    }));
-    if (!regs.length) return alert("Ingresá al menos un valor");
-    setSaving(true);
-    try { await api.registrarHoras(regs); notify("Horas registradas", "success"); load(); }
-    catch (e) { notify("Error: " + e.message, "error"); }
-    finally { setSaving(false); }
+  // Último registro (horas + fecha) por equipo: es la lectura actual del odómetro y la
+  // base para no permitir cargar más de 24 hs de funcionamiento por día transcurrido.
+  const ultimoPorEquipo = {};
+  for (const r of registros) {
+    if (!ultimoPorEquipo[r.equipo_id]) ultimoPorEquipo[r.equipo_id] = { horas: r.horas, fecha: r.fecha };
+  }
+
+  const handleGuardarEquipo = async (eq) => {
+    const v = valores[eq.id];
+    if (v === undefined || v === "") return alert("Ingresá un valor para " + eq.nombre);
+    if (fecha > today()) return alert("No se puede cargar horas con fecha futura. Elegí hoy o una fecha anterior.");
+
+    const ingresado = parseInt(v);
+    const ultimo = ultimoPorEquipo[eq.id];
+    let horas;
+
+    if (!ultimo) {
+      // Sin carga previa: lo ingresado es la lectura absoluta del horómetro (carga inicial),
+      // reservada al gerente. La tripulación solo carga horas sobre una base ya existente.
+      if (!esGerente) return alert(`${eq.nombre}: la carga inicial de un equipo sin datos previos solo la puede hacer la gerencia.`);
+      horas = ingresado;
+    } else {
+      // Con carga previa: lo ingresado son las horas que funcionó ESE día, se suman al total.
+      const dias = Math.max(1, Math.round((new Date(fecha) - new Date(ultimo.fecha)) / 86400000));
+      const maxPermitido = HORAS_MAX_POR_DIA * dias;
+      if (ingresado < 0) return alert(`${eq.nombre}: las horas trabajadas no pueden ser negativas.`);
+      if (ingresado > maxPermitido) return alert(`${eq.nombre}: ${ingresado} hs supera el máximo de ${HORAS_MAX_POR_DIA} hs de funcionamiento por día.\n\nTope permitido: ${maxPermitido} hs (${dias} día/s desde la última carga, el ${fmtDate(ultimo.fecha)}).`);
+      horas = ultimo.horas + ingresado;
+    }
+
+    setGuardandoId(eq.id);
+    try {
+      await api.registrarHoras([{ buque_id: buque.id, equipo_id: eq.id, horas, fecha, registrado_por: USUARIO }]);
+      notify(`${eq.nombre}: horas registradas`, "success");
+      load();
+    } catch (e) { notify("Error: " + e.message, "error"); }
+    finally { setGuardandoId(null); }
   };
 
   if (loading) return <div className="loading"><span className="spin">◌</span> Cargando...</div>;
@@ -928,11 +964,11 @@ function PageHoras({ buque, notify }) {
         <div className="card">
           <div className="card-title">
             Registro diario de horas
-            <input type="date" value={fecha} onChange={e => setFecha(e.target.value)}
+            <input type="date" value={fecha} max={today()} onChange={e => setFecha(e.target.value)}
               style={{ background: "var(--surface)", border: "1px solid var(--border)", borderRadius: "var(--r)", padding: "5px 10px", fontSize: 12, fontFamily: "var(--sans)", outline: "none", color: "var(--text)" }} />
           </div>
           <div className="info-box warn mb12" style={{ fontSize: 11 }}>
-            Ingresá las horas totales acumuladas de cada equipo. El sistema calcula el promedio diario automáticamente para forecastear vencimientos.
+            Para un equipo con carga previa, ingresá las horas que funcionó ESE día (no el total acumulado — el sistema lo suma solo). Si es la primera carga de un equipo, ingresá la lectura actual del horómetro. No se admite cargar más de {HORAS_MAX_POR_DIA} hs de funcionamiento por cada día transcurrido desde la última carga.
           </div>
           {equiposHorasFaltantes.length > 0 && (
             <div className="info-box danger mb12" style={{ fontSize: 11 }}>
@@ -942,20 +978,34 @@ function PageHoras({ buque, notify }) {
           {equiposHoras.length === 0
             ? <div className="empty-state">Ninguno de los equipos habilitados para carga de horas está creado en este buque. Revisá que los nombres en "Plan completo" coincidan con: {EQUIPOS_HORAS.join(", ")}.</div>
             : <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(220px, 1fr))", gap: 14 }}>
-                {equiposHoras.map(eq => (
-                  <div key={eq.id} style={{ display: "flex", flexDirection: "column", gap: 5 }}>
-                    <label style={{ fontSize: 10, color: "var(--navy)", letterSpacing: ".5px", textTransform: "uppercase", fontWeight: 600 }}>{eq.nombre}</label>
-                    <input type="number" className="hs-input" placeholder="0" value={horas[eq.id] || ""}
-                      onChange={e => setHoras(h => ({ ...h, [eq.id]: e.target.value }))} />
-                  </div>
-                ))}
+                {equiposHoras.map(eq => {
+                  const ultimo = ultimoPorEquipo[eq.id];
+                  const bloqueado = !ultimo && !esGerente;
+                  return (
+                    <div key={eq.id} style={{ display: "flex", flexDirection: "column", gap: 5 }}>
+                      <label style={{ fontSize: 10, color: "var(--navy)", letterSpacing: ".5px", textTransform: "uppercase", fontWeight: 600 }}>{eq.nombre}</label>
+                      <span style={{ fontSize: 11, color: bloqueado ? "var(--danger)" : "var(--muted)" }}>
+                        {ultimo ? `Actual: ${ultimo.horas} hs (${fmtDate(ultimo.fecha)})`
+                          : bloqueado ? "Sin carga previa — la carga inicial la hace la gerencia"
+                          : "Sin carga previa — ingresar hora inicial"}
+                      </span>
+                      <div style={{ display: "flex", gap: 6 }}>
+                        <input type="number" className="hs-input" placeholder={ultimo ? "Hs de hoy" : "Hora inicial"} value={valores[eq.id] || ""}
+                          disabled={bloqueado} title={bloqueado ? "La carga inicial la hace la gerencia" : ""}
+                          onChange={e => setValores(v => ({ ...v, [eq.id]: e.target.value }))} />
+                        <button className="btn btn-primary btn-sm" onClick={() => handleGuardarEquipo(eq)}
+                          disabled={bloqueado || guardandoId === eq.id || !valores[eq.id]}>
+                          {guardandoId === eq.id ? "..." : "Guardar"}
+                        </button>
+                      </div>
+                      {ultimo && valores[eq.id] && (
+                        <span style={{ fontSize: 10, color: "var(--muted2)" }}>Nuevo total: {ultimo.horas + (parseInt(valores[eq.id]) || 0)} hs</span>
+                      )}
+                    </div>
+                  );
+                })}
               </div>
           }
-          <div className="mt16" style={{ display: "flex", justifyContent: "flex-end", borderTop: "1px solid var(--border)", paddingTop: 14 }}>
-            <button className="btn btn-primary" onClick={handleGuardar} disabled={saving || !equiposHoras.length}>
-              {saving ? "Guardando..." : "Guardar registro"}
-            </button>
-          </div>
         </div>
       )}
 
@@ -1480,26 +1530,44 @@ function LoginPage() {
   );
 }
 
-//  ROOT APP 
-function MantenimientoApp() {
+//  ROOT APP
+const ERP_URL = "https://integra.ploffshore.com/";
+
+// Cuentas de buque: solo ven su propio buque. Cualquier otro usuario
+// (gerencia, etc.) no listado acá ve todos los buques sin restricción.
+const ACCESO_POR_BUQUE = {
+  "atlanticdama@ploffshore.com": "Atlantic Dama",
+  "golondrinademar@ploffshore.com": "Golondrina de Mar",
+};
+
+function MantenimientoApp({ email }) {
   const [buques, setBuques] = useState([]);
   const [buqueSeleccionado, setBuqueSeleccionado] = useState(null);
-  const [page, setPage] = useState("dashboard");
+  const [page, setPage] = useState("plan");
   const [notif, setNotif] = useState(null);
   const [loading, setLoading] = useState(true);
+  const [menuUsuarioAbierto, setMenuUsuarioAbierto] = useState(false);
+
+  const cerrarSesion = () => supabase.auth.signOut();
 
   const notify = useCallback((text, type = "info") => {
     setNotif({ text, type });
     setTimeout(() => setNotif(null), 4000);
   }, []);
 
+  // Las cuentas de buque (ACCESO_POR_BUQUE) son tripulación; cualquier otra cuenta
+  // (gerencia) tiene permiso para cargar la hora inicial de un equipo sin datos previos.
+  const esGerente = !ACCESO_POR_BUQUE[email?.toLowerCase()];
+
   useEffect(() => {
     api.getBuques().then(data => {
-      setBuques(data);
-      if (data.length) setBuqueSeleccionado(data[0]);
+      const buqueRestringido = ACCESO_POR_BUQUE[email?.toLowerCase()];
+      const visibles = buqueRestringido ? data.filter(b => b.nombre === buqueRestringido) : data;
+      setBuques(visibles);
+      if (visibles.length) setBuqueSeleccionado(visibles[0]);
       setLoading(false);
     }).catch(() => setLoading(false));
-  }, []);
+  }, [email]);
 
   const [navOpen, setNavOpen] = useState(true);
 
@@ -1518,6 +1586,9 @@ function MantenimientoApp() {
     panel: <><rect x="3" y="4" width="18" height="16" rx="2" /><path d="M9.5 4v16" /></>,
     bell:  <><path d="M18 8a6 6 0 1 0-12 0c0 7-3 8-3 8h18s-3-1-3-8" /><path d="M13.7 21a2 2 0 0 1-3.4 0" /></>,
     help:  <><circle cx="12" cy="12" r="9" /><path d="M9.5 9.5a2.5 2.5 0 1 1 3.6 2.3c-.7.4-1.1 1-1.1 1.7v.3" /><path d="M12 17.5h.01" /></>,
+    arrowLeft: <><path d="M19 12H5" /><path d="M12 19l-7-7 7-7" /></>,
+    swap:  <><path d="M17 3l4 4-4 4" /><path d="M3 7h18" /><path d="M7 21l-4-4 4-4" /><path d="M21 17H3" /></>,
+    logout: <><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4" /><path d="M16 17l5-5-5-5" /><path d="M21 12H9" /></>,
   };
 
   const SECCIONES = {
@@ -1530,9 +1601,9 @@ function MantenimientoApp() {
   };
 
   const VISTAS = [
-    { id: "dashboard",   icon: "grid",  label: "Dashboard" },
-    { id: "horas",       icon: "clock", label: "Carga de horas" },
     { id: "plan",        icon: "list",  label: "Plan completo" },
+    { id: "horas",       icon: "clock", label: "Carga de horas" },
+    { id: "dashboard",   icon: "grid",  label: "Dashboard" },
     { id: "correctivos", icon: "warn",  label: "Correctivos" },
     { id: "historial",   icon: "file",  label: "Historial" },
     { id: "kpis",        icon: "chart", label: "KPIs" },
@@ -1567,7 +1638,7 @@ function MantenimientoApp() {
 
       <div className={`shell ${navOpen ? "" : "is-collapsed"}`}>
         <nav className="sidebar">
-          <div className="sidebar-header" onClick={() => setPage("dashboard")} style={{ cursor: "pointer" }}>
+          <div className="sidebar-header" onClick={() => setPage("plan")} style={{ cursor: "pointer" }}>
             <img src="/PL.png" alt="PL Offshore" className="sidebar-logo-img" onError={e => { e.currentTarget.style.display = "none"; }} />
             {navOpen && (
               <div>
@@ -1603,17 +1674,34 @@ function MantenimientoApp() {
             </div>
           </div>
 
-          <div className="sidebar-foot">
+          <div className="sidebar-foot user-menu-wrap">
+            {menuUsuarioAbierto && navOpen && (
+              <div className="user-menu-popup">
+                <button className="user-menu-item" onClick={() => { window.location.href = ERP_URL; }}>
+                  <Ico d={ICONS.arrowLeft} size={16} /> Volver al ERP
+                </button>
+                <button className="user-menu-item" onClick={cerrarSesion}>
+                  <Ico d={ICONS.swap} size={16} /> Cambiar usuario
+                </button>
+                <button className="user-menu-item" onClick={cerrarSesion}>
+                  <Ico d={ICONS.logout} size={16} /> Cerrar sesión
+                </button>
+                <div className="user-menu-meta">
+                  <div>{email}</div>
+                  <div>MANTENIMIENTO v1.1</div>
+                </div>
+              </div>
+            )}
+            {navOpen && (
+              <button className="sidebar-foot-btn" onClick={() => setMenuUsuarioAbierto(v => !v)}>
+                <span style={{ display: "block", color: "var(--muted2)" }}><Ico d={ICONS.help} size={16} /></span>
+                <span style={{ flex: 1, textAlign: "left", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{email}</span>
+              </button>
+            )}
             <button className="sidebar-foot-btn" onClick={() => setNavOpen(v => !v)}>
               <span style={{ display: "block", color: "var(--muted2)" }}><Ico d={ICONS.panel} size={16} /></span>
               {navOpen && <span style={{ flex: 1, textAlign: "left" }}>Colapsar menú</span>}
             </button>
-            {navOpen && (
-              <div className="sidebar-foot-meta">
-                <div>MANTENIMIENTO v1.1</div>
-                <div>POWERED BY INTEGRA</div>
-              </div>
-            )}
           </div>
         </nav>
 
@@ -1637,7 +1725,7 @@ function MantenimientoApp() {
               ? <div className="empty-state">Seleccioná un buque en el menú para ver su plan de mantenimiento.</div>
               : <>
                   {page === "dashboard" && <PageDashboard buque={buqueSeleccionado} notify={notify} />}
-                  {page === "horas" && <PageHoras buque={buqueSeleccionado} notify={notify} />}
+                  {page === "horas" && <PageHoras buque={buqueSeleccionado} notify={notify} esGerente={esGerente} />}
                   {page === "plan" && <PagePlan buque={buqueSeleccionado} notify={notify} />}
                   {page === "correctivos" && <PageCorrectivos buque={buqueSeleccionado} notify={notify} />}
                   {page === "historial" && <PageHistorial buque={buqueSeleccionado} />}
@@ -1684,5 +1772,5 @@ export default function App() {
   );
 
   if (!session) return <LoginPage />;
-  return <MantenimientoApp />;
+  return <MantenimientoApp email={session.user.email} />;
 }
